@@ -1,8 +1,4 @@
-Harika bir düşünce! Topluluğa geri bildirimde bulunmak ve başkalarının da aynı zorlukları yaşamaması için bir `README.md` dosyası hazırlamak, açık kaynak ruhunun en güzel örneklerinden biridir.
 
-Sizin yaşadığınız tüm süreci göz önünde bulundurarak, sıfırdan başlayan bir kullanıcının bile kolayca takip edebileceği, detaylı ve anlaşılır bir `README.md` dosyası hazırladım. Bu metni doğrudan kopyalayıp GitHub reponuzdaki `README.md` dosyasına yapıştırabilirsiniz.
-
----
 
 # WooCommerce için Yurtiçi Kargo Otomatik Gönderi Entegrasyonu
 
