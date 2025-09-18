@@ -1,3 +1,5 @@
+
+
 <?php
 /**
  * Plugin Name:       Benim Yurtiçi Kargo Entegrasyonum (Nihai Sürüm - Kendi Kendine Yeterli)
@@ -10,50 +12,117 @@
 if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
+// ===================================================================================
+// BÖLÜM 1: OTOMATİK GÖNDERİ OLUŞTURMA (GÜVENLİ VERİ GÖNDERİMİ İLE)
+// ===================================================================================
+add_action( 'woocommerce_order_status_changed', 'yk_api_gonderi_olustur_v8', 20, 4 );
 
-// ===================================================================================
-// BÖLÜM 1: OTOMATİK GÖNDERİ OLUŞTURMA
-// ===================================================================================
-add_action( 'woocommerce_order_status_changed', 'yk_api_gonderi_olustur', 20, 4 );
-function yk_api_gonderi_olustur( $order_id, $status_from, $status_to, $order ) {
+function yk_api_gonderi_olustur_v8( $order_id, $status_from, $status_to, $order ) {
     if ( 'kargoya-hazir' !== $status_to ) { return; }
-    if ( function_exists('ast_get_tracking_items') && ast_get_tracking_items( $order_id ) ) { $order->add_order_note( 'Bilgi: Bu sipariş için daha önce kargo gönderisi oluşturulmuş.' ); return; }
-    $api_url = 'http://testwebservices.yurticikargo.com:9090/KOPSWebServices/ShippingOrderDispatcherServices?wsdl';
+    if ( function_exists('ast_get_tracking_items') && ast_get_tracking_items( $order_id ) ) { return; }
+
+    // --- API AYARLARI ---
+   $api_url = 'http://testwebservices.yurticikargo.com:9090/KOPSWebServices/ShippingOrderDispatcherServices?wsdl';
     $ws_user_name = 'YKTEST'; $ws_password = 'YK';
-    $receiver_name = $order->get_formatted_shipping_full_name();
-    $receiver_address = trim( $order->get_shipping_address_1() . ' ' . $order->get_shipping_address_2() );
-    $city_name = $order->get_shipping_city();
-    $town_name = $order->get_shipping_state();
-    $receiver_phone = $order->get_billing_phone();
+
     $unique_cargo_key = 'WC-' . $order_id;
-    $soap_request_body = <<<XML
+
+    // ADIM 1: Gönderiyi oluştur ve sisteme kaydet
+    // =================================================
+    
+    // --- VERİYİ GÜVENLİ HALE GETİRME (SANITIZATION) ---
+    // Müşteri verilerini XML için güvenli hale getiriyoruz. Bu, '&' gibi özel karakter hatalarını çözer.
+    $receiver_name    = htmlspecialchars($order->get_formatted_shipping_full_name(), ENT_XML1, 'UTF-8');
+    $receiver_address = htmlspecialchars(trim( $order->get_shipping_address_1() . ' ' . $order->get_shipping_address_2() ), ENT_XML1, 'UTF-8');
+    $city_name        = htmlspecialchars($order->get_shipping_city(), ENT_XML1, 'UTF-8');
+    $town_name        = htmlspecialchars($order->get_shipping_state(), ENT_XML1, 'UTF-8');
+    $receiver_phone   = htmlspecialchars($order->get_billing_phone(), ENT_XML1, 'UTF-8');
+    
+    $create_soap_request = <<<XML
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ship="http://yurticikargo.com.tr/ShippingOrderDispatcherServices"><soapenv:Header/><soapenv:Body><ship:createShipment><wsUserName>{$ws_user_name}</wsUserName><wsPassword>{$ws_password}</wsPassword><userLanguage>TR</userLanguage><ShippingOrderVO><cargoKey>{$unique_cargo_key}</cargoKey><invoiceKey>{$unique_cargo_key}</invoiceKey><receiverCustName>{$receiver_name}</receiverCustName><receiverAddress>{$receiver_address}</receiverAddress><cityName>{$city_name}</cityName><townName>{$town_name}</townName><receiverPhone1>{$receiver_phone}</receiverPhone1></ShippingOrderVO></ship:createShipment></soapenv:Body></soapenv:Envelope>
 XML;
-    $response = wp_remote_post( $api_url, ['headers' => ['Content-Type' => 'text/xml; charset=utf-8'],'body' => $soap_request_body,'timeout' => 30] );
-    if ( is_wp_error( $response ) ) { $order->add_order_note( '❌ Yurtiçi Kargo API\'sine bağlanırken bir hata oluştu: ' . $response->get_error_message() ); return; }
-    $response_body = wp_remote_retrieve_body( $response );
+
+    $response_create = wp_remote_post( $api_url, ['headers' => ['Content-Type' => 'text/xml; charset=utf-8'],'body' => $create_soap_request,'timeout' => 30] );
+
+    if ( is_wp_error( $response_create ) ) {
+        $order->add_order_note('❌ Adım 1 Hatası: Gönderi oluşturulurken API\'ye bağlanılamadı: ' . $response_create->get_error_message());
+        return;
+    }
+    
+    $response_create_body = wp_remote_retrieve_body($response_create);
+    
     try {
-        if (empty($response_body)) { throw new Exception("API yanıtı boş geldi."); }
-        $dom = new DOMDocument(); $dom->loadXML($response_body); $xpath = new DOMXPath($dom);
+        if (empty($response_create_body)) { throw new Exception("API yanıtı boş geldi."); }
+        
+        // Gelen yanıtta 'faultstring' kelimesi varsa, bu doğrudan bir XML hatasıdır.
+        if (strpos($response_create_body, 'faultstring') !== false) {
+             // Hatayı daha okunaklı hale getirelim.
+            preg_match('/<faultstring>(.*?)<\/faultstring>/', $response_create_body, $matches);
+            $error_message = isset($matches[1]) ? $matches[1] : 'Genel XML Hatası';
+            throw new Exception($error_message);
+        }
+
+        $dom = new DOMDocument();
+        $dom->loadXML($response_create_body);
+        $xpath = new DOMXPath($dom);
         $xpath->registerNamespace('ns1', 'http://yurticikargo.com.tr/ShippingOrderDispatcherServices');
         $out_flag_nodes = $xpath->query('//ns1:createShipmentResponse/ShippingOrderResultVO/outFlag');
+        
         if ($out_flag_nodes->length > 0) {
-            $out_flag = (int) $out_flag_nodes->item(0)->nodeValue;
-            if ( $out_flag === 0 ) {
-                $cargo_key_nodes = $xpath->query('//ns1:createShipmentResponse/ShippingOrderResultVO/shippingOrderDetailVO/cargoKey');
-                if ($cargo_key_nodes->length > 0) {
-                    $tracking_number = $cargo_key_nodes->item(0)->nodeValue;
-                    if(function_exists('ast_insert_tracking_number')) { ast_insert_tracking_number( $order_id, $tracking_number, 'yurtici-kargo', date('Y-m-d') ); }
-                    $order->add_order_note( "✅ Yurtiçi Kargo gönderisi başarıyla oluşturuldu. Takip Numarası: {$tracking_number}" );
-                } else { throw new Exception("Başarılı yanıtta cargoKey bulunamadı."); }
-            } else {
+            if ((int) $out_flag_nodes->item(0)->nodeValue !== 0) {
                 $error_message_nodes = $xpath->query('//ns1:createShipmentResponse/ShippingOrderResultVO/shippingOrderDetailVO/errMessage');
                 $error_message = ($error_message_nodes->length > 0) ? $error_message_nodes->item(0)->nodeValue : "Bilinmeyen API hatası.";
-                $order->add_order_note( "❌ Yurtiçi Kargo API Hatası: {$error_message}" );
+                throw new Exception($error_message);
             }
-        } else { throw new Exception("Yanıt içinde 'outFlag' değeri bulunamadı."); }
-    } catch (Exception $e) { $order->add_order_note( '❌ Yurtiçi Kargo API yanıtı işlenirken bir hata oluştu: ' . $e->getMessage() ); }
-}
+        } else {
+            throw new Exception("Yanıt içinde 'outFlag' değeri bulunamadı. Gelen Ham Yanıt: " . esc_html($response_create_body));
+        }
+
+    } catch (Exception $e) {
+        $order->add_order_note('❌ Adım 1 Hatası: Gönderi oluşturulamadı. API Yanıtı: ' . $e->getMessage());
+        return;
+    }
+    
+    $order->add_order_note('✅ Adım 1 Başarılı: Gönderi kaydedildi. Şimdi resmi takip no alınıyor...');
+    
+    // ADIM 2: Oluşturulan gönderinin resmi takip numarasını sorgula
+       // =================================================================
+       $query_soap_request = <<<XML
+   <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ship="http://yurticikargo.com.tr/ShippingOrderDispatcherServices"><soapenv:Header/><soapenv:Body><ship:queryShipment><wsUserName>{$ws_user_name}</wsUserName><wsPassword>{$ws_password}</wsPassword><userLanguage>TR</userLanguage><keys>{$unique_cargo_key}</keys><keyType>0</keyType><addHistoricalData>false</addHistoricalData><onlyTracking>false</onlyTracking></ship:queryShipment></soapenv:Body></soapenv:Envelope>
+   XML;
+
+       $response_query = wp_remote_post( $api_url, ['headers' => ['Content-Type' => 'text/xml; charset=utf-8'], 'body' => $query_soap_request, 'timeout' => 30] );
+
+       if ( is_wp_error( $response_query ) ) {
+           $order->add_order_note('❌ Adım 2 Hatası: Resmi takip numarası sorgulanırken API\'ye bağlanılamadı.');
+           return;
+       }
+
+       $response_query_body = wp_remote_retrieve_body($response_query);
+       try {
+           $dom_q = new DOMDocument();
+           $dom_q->loadXML($response_query_body);
+           $xpath_q = new DOMXPath($dom_q);
+           $xpath_q->registerNamespace('ns1', 'http://yurticikargo.com.tr/ShippingOrderDispatcherServices');
+           
+           $doc_id_nodes = $xpath_q->query('//ns1:queryShipmentResponse/ShippingDeliveryVO/shippingDeliveryDetailVO/docId');
+
+           if ($doc_id_nodes->length > 0 && !empty($doc_id_nodes->item(0)->nodeValue)) {
+               $real_tracking_number = $doc_id_nodes->item(0)->nodeValue;
+               if(function_exists('ast_insert_tracking_number')) {
+                   ast_insert_tracking_number( $order_id, $real_tracking_number, 'yurtici-kargo', date('Y-m-d') );
+               }
+               $order->add_order_note( "✅ Adım 2 Başarılı: Resmi Yurtiçi Kargo takip numarası alındı ve kaydedildi: {$real_tracking_number}" );
+           } else {
+               if(function_exists('ast_insert_tracking_number')) {
+                   ast_insert_tracking_number( $order_id, $unique_cargo_key, 'yurtici-kargo', date('Y-m-d') );
+               }
+               $order->add_order_note( "⚠️ Bilgi: Resmi takip numarası henüz oluşmamış. Referans kodu kaydedildi: {$unique_cargo_key}. Kargo şubede okutulunca link çalışacaktır." );
+           }
+       } catch (Exception $e) {
+           $order->add_order_note('❌ Adım 2 Hatası: Resmi takip numarası sorgulanırken API yanıtı işlenemedi. Gelen Ham Yanıt: ' . esc_html($response_query_body));
+       }
+   }
 
 // ===================================================================================
 // BÖLÜM 2: BARKOD GÖRÜNTÜLEME
@@ -108,8 +177,8 @@ function yk_cron_aktivasyonu() {
 }
 add_action( 'yk_saatlik_kargo_guncelleme_event', 'yk_kargo_durumlarini_guncelle' );
 function yk_kargo_durumlarini_guncelle() {
-    $api_url = 'http://testwebservices.yurticikargo.com:9090/KOPSWebServices/ShippingOrderDispatcherServices?wsdl';
-    $ws_user_name = 'YKTEST'; $ws_password = 'YK';
+  $api_url = 'http://testwebservices.yurticikargo.com:9090/KOPSWebServices/ShippingOrderDispatcherServices?wsdl';
+    $ws_user_name = 'YKTEST'; $ws_password = 'YK'; 
     if (!function_exists('wc_get_orders')) return;
     $orders_to_check = wc_get_orders( array('status' => 'kargoya-hazir', 'limit'  => -1) );
     if ( empty( $orders_to_check ) ) { return; }
@@ -155,4 +224,122 @@ register_deactivation_hook( __FILE__, 'yk_cron_iptali' );
 function yk_cron_iptali() {
     $timestamp = wp_next_scheduled( 'yk_saatlik_kargo_guncelleme_event' );
     wp_unschedule_event( $timestamp, 'yk_saatlik_kargo_guncelleme_event' );
+}
+// ===================================================================================
+// BÖLÜM 5: GÖNDERİ İPTAL ETME ÖZELLİĞİ
+// ===================================================================================
+
+/**
+ * Sipariş detay sayfasına "Kargo İptal" meta kutusunu ekler.
+ */
+add_action( 'add_meta_boxes', 'yk_iptal_meta_box_ekle' );
+function yk_iptal_meta_box_ekle() {
+    // Sadece takip numarası olan siparişlerde bu kutuyu göster
+    global $post;
+    if ( function_exists('ast_get_tracking_items') && ast_get_tracking_items($post->ID) ) {
+        add_meta_box(
+            'yk_kargo_iptal_box',
+            'Yurtiçi Kargo İşlemleri',
+            'yk_iptal_meta_box_icerigi',
+            'shop_order',
+            'side',
+            'core'
+        );
+    }
+}
+
+/**
+ * Meta kutusunun içeriğini (iptal butonunu) oluşturur.
+ */
+function yk_iptal_meta_box_icerigi( $post ) {
+    $order_id = $post->ID;
+    
+    // Güvenlik için bir nonce oluşturuyoruz.
+    $iptal_linki = wp_nonce_url(
+        admin_url( 'post.php?post=' . $order_id . '&action=edit&yk_kargo_iptal_et=true' ),
+        'yk_kargo_iptal_nonce_' . $order_id
+    );
+
+    echo '<p>Oluşturulan kargo gönderisini iptal etmek için aşağıdaki butonu kullanabilirsiniz.</p>';
+    echo '<p><strong>Not:</strong> Sadece şubeden çıkış yapmamış kargolar iptal edilebilir.</p>';
+    echo '<a href="' . esc_url($iptal_linki) . '" class="button button-primary" style="width: 100%; text-align: center; background-color: #d9534f; border-color: #d43f3a;" onclick="return confirm(\'Bu kargo gönderisini iptal etmek istediğinizden emin misiniz?\');">Kargoyu İptal Et</a>';
+}
+
+/**
+ * İptal butonuna basıldığında çalışan ana fonksiyon.
+ */
+add_action( 'admin_init', 'yk_kargo_iptal_istegini_isle' );
+function yk_kargo_iptal_istegini_isle() {
+    // Sadece doğru parametreler varsa ve yetki kontrolü başarılıysa çalış.
+    if ( !isset($_GET['yk_kargo_iptal_et']) || !isset($_GET['post']) ) {
+        return;
+    }
+    
+    $order_id = intval($_GET['post']);
+    
+    // Nonce güvenlik kontrolü
+    check_admin_referer( 'yk_kargo_iptal_nonce_' . $order_id );
+
+    $order = wc_get_order($order_id);
+    if ( !$order ) return;
+    
+    $tracking_items = function_exists('ast_get_tracking_items') ? ast_get_tracking_items($order_id) : [];
+
+    if ( empty($tracking_items) ) {
+        $order->add_order_note('İptal Hatası: Siparişe ait bir takip numarası bulunamadı.');
+        return;
+    }
+
+    $tracking_number = $tracking_items[0]['tracking_number'];
+    $tracking_id = $tracking_items[0]['tracking_id'];
+
+    // API Bilgileri
+  $api_url = 'http://testwebservices.yurticikargo.com:9090/KOPSWebServices/ShippingOrderDispatcherServices?wsdl';
+    $ws_user_name = 'YKTEST'; $ws_password = 'YK'; 
+
+    $soap_request_body = <<<XML
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ship="http://yurticikargo.com.tr/ShippingOrderDispatcherServices">
+   <soapenv:Header/>
+   <soapenv:Body>
+      <ship:cancelShipment>
+         <wsUserName>{$ws_user_name}</wsUserName>
+         <wsPassword>{$ws_password}</wsPassword>
+         <userLanguage>TR</userLanguage>
+         <cargoKeys>{$tracking_number}</cargoKeys>
+      </ship:cancelShipment>
+   </soapenv:Body>
+</soapenv:Envelope>
+XML;
+
+    $response = wp_remote_post( $api_url, ['body' => $soap_request_body, 'headers' => ['Content-Type' => 'text/xml; charset=utf-8'], 'timeout' => 30] );
+
+    if ( is_wp_error( $response ) ) {
+        $order->add_order_note('❌ Kargo iptal edilemedi. API bağlantı hatası: ' . $response->get_error_message());
+    } else {
+        $response_body = wp_remote_retrieve_body($response);
+        try {
+            $xml = new SimpleXMLElement(preg_replace('/(<\/?)(\w+):([^>]*>)/', '$1$2$3', $response_body));
+            $result = $xml->soapBody->cancelShipmentResponse->ShippingOrderResultVO;
+            $out_flag = (int) $result->outFlag;
+
+            if ($out_flag === 0) {
+                // Başarılı!
+                $order->add_order_note('✅ Yurtiçi Kargo gönderisi başarıyla iptal edildi.');
+                // AST'den takip numarasını sil
+                if (function_exists('ast_delete_tracking_item')) {
+                    ast_delete_tracking_item($order_id, $tracking_id);
+                }
+            } else {
+                // Başarısız
+                $err_message = (string) $result->shippingCancelDetailVO->errMessage;
+                $order->add_order_note('❌ Kargo iptal edilemedi. API Yanıtı: ' . $err_message);
+            }
+        } catch (Exception $e) {
+            $order->add_order_note('❌ Kargo iptali sırasında API yanıtı işlenemedi.');
+        }
+    }
+    
+    // Sayfanın yeniden gönderilmesini önlemek için kullanıcıyı temiz bir URL'ye yönlendir.
+    wp_safe_redirect( admin_url('post.php?post=' . $order_id . '&action=edit') );
+    exit();
 }
